@@ -5,7 +5,8 @@
 - Jonathan Cadena Loaiza
 - Juan Felipe Pelaez Roman
 
-
+-------------------------------------
+modificación para usar modelo gemini
 
 
 
