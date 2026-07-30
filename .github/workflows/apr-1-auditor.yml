@@ -1,4 +1,4 @@
-name: apr-1 auditor (debug)
+name: apr-1 auditor
 
 on:
   pull_request_target:
@@ -29,17 +29,18 @@ jobs:
         env:
           APR1_MODEL: ${{ secrets.APR1_MODEL || 'openai/gpt-4o' }}
           GH_MODELS_TOKEN: ${{ secrets.GH_PAT }}
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_PROJECT_KEY: ${{ secrets.SONAR_PROJECT_KEY || 'Liceth02usma_fastify' }}
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           script: |
             const fs = require('node:fs')
 
-            // === DEBUG: confirmar qué variables de entorno llegaron ===
             core.startGroup('DEBUG: variables de entorno recibidas')
             core.info(`APR1_MODEL = ${process.env.APR1_MODEL || '(vacío)'}`)
             core.info(`GH_MODELS_TOKEN presente: ${Boolean(process.env.GH_MODELS_TOKEN)}`)
-            core.info(`GH_MODELS_TOKEN longitud: ${(process.env.GH_MODELS_TOKEN || '').length}`)
-            core.info(`GITHUB_TOKEN (input github-token, manejado por el action, no por env) - no se imprime aquí`)
+            core.info(`SONAR_TOKEN presente: ${Boolean(process.env.SONAR_TOKEN)}`)
+            core.info(`SONAR_PROJECT_KEY = ${process.env.SONAR_PROJECT_KEY}`)
             core.endGroup()
 
             const annexPath = '.github/apr/anexo-tecnico-iso-iec-25010.md'
@@ -54,18 +55,9 @@ jobs:
               return
             }
 
-            core.startGroup('DEBUG: anexo técnico')
-            core.info(`Longitud del anexo: ${annex.length} caracteres`)
-            core.info(`Primeras 200 caracteres:\n${annex.slice(0, 200)}`)
-            core.endGroup()
-
             const owner = context.repo.owner
             const repo = context.repo.repo
             const pullNumber = context.payload.pull_request.number
-
-            core.startGroup('DEBUG: contexto del PR')
-            core.info(`owner=${owner} repo=${repo} pullNumber=${pullNumber}`)
-            core.endGroup()
 
             const pr = await github.rest.pulls.get({
               owner,
@@ -82,10 +74,6 @@ jobs:
                 per_page: 100
               }
             )
-
-            core.startGroup('DEBUG: archivos del PR')
-            core.info(`Total de archivos: ${files.length}`)
-            core.endGroup()
 
             const workflowRunsResponse = await github.rest.actions.listWorkflowRunsForRepo({
               owner,
@@ -116,6 +104,83 @@ jobs:
               .map(run => `- ${run.name}: status=${run.status}, conclusion=${run.conclusion || 'N/A'}, url=${run.html_url}`)
               .join('\n') || '- Sin ejecuciones de CI asociadas al commit del PR.'
 
+            // === MÉTRICAS DE SONARCLOUD ===
+            const SONAR_METRIC_KEYS = [
+              'coverage',
+              'complexity',
+              'cognitive_complexity',
+              'duplicated_lines_density',
+              'reliability_rating',
+              'security_rating',
+              'security_hotspots_reviewed',
+              'sqale_rating',
+              'sqale_debt_ratio'
+            ].join(',')
+
+            const METRIC_LABELS = {
+              coverage: 'Coverage (Line/Branch Coverage) — condición: Adecuación funcional',
+              complexity: 'Cyclomatic Complexity (agregada del proyecto/PR) — condición: Eficiencia de desempeño',
+              cognitive_complexity: 'Cognitive Complexity (agregada) — condición: Usabilidad',
+              duplicated_lines_density: 'Duplicated Lines (%) — condición: Compatibilidad',
+              reliability_rating: 'Reliability Rating — condición: Fiabilidad',
+              security_rating: 'Security Rating — condición: Seguridad',
+              security_hotspots_reviewed: 'Security Hotspots Reviewed (%) — condición: Seguridad',
+              sqale_rating: 'Maintainability Rating — condición: Mantenibilidad',
+              sqale_debt_ratio: 'Technical Debt Ratio (%) — condición: Mantenibilidad'
+            }
+
+            async function fetchSonarMeasures(component, extraParam) {
+              const url = `https://sonarcloud.io/api/measures/component?component=${encodeURIComponent(component)}&${extraParam}&metricKeys=${SONAR_METRIC_KEYS}`
+              const res = await fetch(url, {
+                headers: {
+                  Authorization: `Basic ${Buffer.from(`${process.env.SONAR_TOKEN}:`).toString('base64')}`
+                }
+              })
+              const text = await res.text()
+              let json = null
+              try { json = JSON.parse(text) } catch (e) { /* noop */ }
+              return { ok: res.ok, status: res.status, json, raw: text }
+            }
+
+            let sonarEvidence = 'No se pudo obtener evidencia de SonarCloud.'
+            let sonarScopeNote = ''
+
+            if (!process.env.SONAR_TOKEN) {
+              sonarEvidence = 'No hay SONAR_TOKEN configurado en los secrets del repositorio; no se consultó SonarCloud.'
+            } else {
+              core.startGroup('DEBUG: consulta a SonarCloud')
+              const projectKey = process.env.SONAR_PROJECT_KEY
+
+              // 1) intento: métricas específicas del análisis de este PR
+              let result = await fetchSonarMeasures(projectKey, `pullRequest=${pullNumber}`)
+              core.info(`Intento pullRequest=${pullNumber} -> status ${result.status}`)
+
+              if (result.ok && result.json && result.json.component) {
+                sonarScopeNote = `Métricas del análisis específico del Pull Request #${pullNumber} en SonarCloud.`
+              } else {
+                // 2) fallback: métricas generales de la rama main
+                core.warning(`SonarCloud no devolvió análisis para el PR #${pullNumber} (status ${result.status}). Usando fallback a la rama main.`)
+                result = await fetchSonarMeasures(projectKey, 'branch=main')
+                core.info(`Intento branch=main -> status ${result.status}`)
+                sonarScopeNote = 'ADVERTENCIA DE ALCANCE: SonarCloud no tiene un análisis específico para este PR. Las métricas mostradas son del estado GENERAL del proyecto (rama main), no exclusivas del diff de este PR.'
+              }
+
+              if (result.ok && result.json && result.json.component && result.json.component.measures) {
+                const measures = result.json.component.measures
+                const measuredKeys = new Set(measures.map(m => m.metric))
+                const lines = measures.map(m => `- ${METRIC_LABELS[m.metric] || m.metric}: ${m.value}`)
+                const missing = SONAR_METRIC_KEYS.split(',').filter(k => !measuredKeys.has(k))
+                if (missing.length) {
+                  lines.push(...missing.map(k => `- ${METRIC_LABELS[k] || k}: SIN DATO (no reportado por SonarCloud)`))
+                }
+                sonarEvidence = `${sonarScopeNote}\n\n${lines.join('\n')}`
+              } else {
+                sonarEvidence = `No se pudieron obtener métricas de SonarCloud (HTTP ${result.status}). Respuesta: ${result.raw.slice(0, 300)}`
+              }
+              core.info(`Evidencia de Sonar construida:\n${sonarEvidence}`)
+              core.endGroup()
+            }
+
             const systemPrompt = [
               'Eres APR-1 (Auditor de Pull Requests), un agente auditor de calidad de software',
               'que actúa en nombre de un comité de interventoría para el proyecto fastify/fastify.',
@@ -127,7 +192,7 @@ jobs:
               '1. El Anexo Técnico ISO/IEC 25010 del proyecto: una lista de condiciones con su',
               '   criterio, umbral y método de medición esperado.',
               '2. Evidencia técnica de un Pull Request específico: el diff del código, la descripción',
-              '   del PR y el resultado del pipeline de CI.',
+              '   del PR, el resultado del pipeline de CI, y métricas de SonarCloud asociadas.',
               '',
               'TU TAREA:',
               'Evalúa el Pull Request ÚNICAMENTE contra las condiciones del Anexo Técnico. Por',
@@ -136,6 +201,8 @@ jobs:
               '- Clasifícala en una de tres categorías: CUMPLE, NO CUMPLE o SIN EVIDENCIA SUFICIENTE.',
               '- Nunca marques CUMPLE si no tienes evidencia directa y explícita que lo sustente.',
               '  Ante la duda, clasifica como SIN EVIDENCIA SUFICIENTE en lugar de asumir.',
+              '- Si la evidencia de SonarCloud indica que las métricas son del proyecto general y no',
+              '  del PR específico, ten esto en cuenta como una limitación y menciónalo si aplica.',
               '- No asumas buenas intenciones del autor del PR: verifica, no infieras.',
               '',
               'REGLAS ESTRICTAS:',
@@ -154,7 +221,7 @@ jobs:
               'No agregues introducción, conclusión, ni recomendaciones fuera de la tabla.'
             ].join('\n')
 
-            const userPrompt = `ANEXO TÉCNICO ISO/IEC 25010:\n\n${annex}\n\nEVIDENCIA DEL PULL REQUEST:\n\n- PR: #${pr.data.number}\n- Título: ${pr.data.title}\n- URL: ${pr.data.html_url}\n- Autor: ${pr.data.user?.login || 'N/A'}\n\nDescripción del PR:\n${pr.data.body || 'Sin descripción.'}\n\nResumen de archivos modificados:\n${fileSummary}\n\nExtracto de diff:\n${patchSummary}\n\nResultado de CI asociado al commit del PR:\n${ciEvidence}`
+            const userPrompt = `ANEXO TÉCNICO ISO/IEC 25010:\n\n${annex}\n\nEVIDENCIA DEL PULL REQUEST:\n\n- PR: #${pr.data.number}\n- Título: ${pr.data.title}\n- URL: ${pr.data.html_url}\n- Autor: ${pr.data.user?.login || 'N/A'}\n\nDescripción del PR:\n${pr.data.body || 'Sin descripción.'}\n\nResumen de archivos modificados:\n${fileSummary}\n\nExtracto de diff:\n${patchSummary}\n\nResultado de CI asociado al commit del PR:\n${ciEvidence}\n\nMétricas de SonarCloud:\n${sonarEvidence}`
 
             const apiEndpoint = 'https://models.github.ai/inference/chat/completions'
             const modelName = process.env.APR1_MODEL || 'openai/gpt-4o'
@@ -165,7 +232,7 @@ jobs:
             core.info(`Modelo: ${modelName}`)
             core.info(`Token presente antes del fetch: ${Boolean(token)}`)
             if (!token) {
-              core.warning('GH_MODELS_TOKEN está vacío. La llamada fallará con 401. Revisa que el secret GH_PAT exista en el repo/organización y que tenga permiso "models: read".')
+              core.warning('GH_MODELS_TOKEN está vacío. La llamada fallará con 401.')
             }
             core.endGroup()
 
@@ -188,7 +255,7 @@ jobs:
             const rawText = await response.text()
             core.startGroup('DEBUG: respuesta cruda del modelo')
             core.info(`HTTP status: ${response.status}`)
-            core.info(`Cuerpo de la respuesta (primeros 2000 caracteres):\n${rawText.slice(0, 2000)}`)
+            core.info(`Cuerpo (primeros 2000 caracteres):\n${rawText.slice(0, 2000)}`)
             core.endGroup()
 
             let result = null
@@ -213,7 +280,7 @@ jobs:
               '### 🤖 Reporte de Auditoría SQA - APR-1 (Agente IA)',
               '',
               '> 🚨 **PUNTO DE CONTROL HUMANO OBLIGATORIO**:',
-              '> Esta auditoría es un **insumo preliminar** generado automáticamente por el agente APR-1. Un ingeniero auditor del equipo DEBE verificar manualmente que la evidencia citada (CI, diff del código, descripción) sea real y suficiente antes de incorporar este resultado al dictamen final de la interventoría. El agente NO toma decisiones de aprobación ni fusión del PR.',
+              '> Esta auditoría es un **insumo preliminar** generado automáticamente por el agente APR-1. Un ingeniero auditor del equipo DEBE verificar manualmente que la evidencia citada (CI, diff del código, SonarCloud) sea real y suficiente antes de incorporar este resultado al dictamen final de la interventoría. El agente NO toma decisiones de aprobación ni fusión del PR.',
               '',
               auditTable
             ].join('\n')
