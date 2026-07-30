@@ -36,13 +36,6 @@ jobs:
           script: |
             const fs = require('node:fs')
 
-            core.startGroup('DEBUG: variables de entorno recibidas')
-            core.info(`APR1_MODEL = ${process.env.APR1_MODEL || '(vacío)'}`)
-            core.info(`GH_MODELS_TOKEN presente: ${Boolean(process.env.GH_MODELS_TOKEN)}`)
-            core.info(`SONAR_TOKEN presente: ${Boolean(process.env.SONAR_TOKEN)}`)
-            core.info(`SONAR_PROJECT_KEY = ${process.env.SONAR_PROJECT_KEY}`)
-            core.endGroup()
-
             const annexPath = '.github/apr/anexo-tecnico-iso-iec-25010.md'
             if (!fs.existsSync(annexPath)) {
               core.setFailed(`No existe ${annexPath}.`)
@@ -105,10 +98,11 @@ jobs:
               .join('\n') || '- Sin ejecuciones de CI asociadas al commit del PR.'
 
             // === MÉTRICAS DE SONARCLOUD ===
-            const SONAR_METRIC_KEYS = [
+            const sonarToken = process.env.SONAR_TOKEN
+            const sonarProjectKey = process.env.SONAR_PROJECT_KEY
+            const sonarMetricKeys = [
               'coverage',
               'complexity',
-              'cognitive_complexity',
               'duplicated_lines_density',
               'reliability_rating',
               'security_rating',
@@ -117,24 +111,22 @@ jobs:
               'sqale_debt_ratio'
             ].join(',')
 
-            const METRIC_LABELS = {
-              coverage: 'Coverage (Line/Branch Coverage) — condición: Adecuación funcional',
-              complexity: 'Cyclomatic Complexity (agregada del proyecto/PR) — condición: Eficiencia de desempeño',
-              cognitive_complexity: 'Cognitive Complexity (agregada) — condición: Usabilidad',
-              duplicated_lines_density: 'Duplicated Lines (%) — condición: Compatibilidad',
-              reliability_rating: 'Reliability Rating — condición: Fiabilidad',
-              security_rating: 'Security Rating — condición: Seguridad',
-              security_hotspots_reviewed: 'Security Hotspots Reviewed (%) — condición: Seguridad',
-              sqale_rating: 'Maintainability Rating — condición: Mantenibilidad',
-              sqale_debt_ratio: 'Technical Debt Ratio (%) — condición: Mantenibilidad'
+            const metricLabels = {
+              coverage: 'Coverage (Line/Branch)',
+              complexity: 'Cyclomatic Complexity (total del proyecto)',
+              duplicated_lines_density: 'Duplicated Lines (%)',
+              reliability_rating: 'Reliability Rating',
+              security_rating: 'Security Rating',
+              security_hotspots_reviewed: 'Security Hotspots Reviewed (%)',
+              sqale_rating: 'Maintainability Rating',
+              sqale_debt_ratio: 'Technical Debt Ratio (%)'
             }
 
-            async function fetchSonarMeasures(component, extraParam) {
-              const url = `https://sonarcloud.io/api/measures/component?component=${encodeURIComponent(component)}&${extraParam}&metricKeys=${SONAR_METRIC_KEYS}`
+            async function fetchSonarMeasures(query) {
+              const url = `https://sonarcloud.io/api/measures/component?${query}`
+              const auth = Buffer.from(`${sonarToken}:`).toString('base64')
               const res = await fetch(url, {
-                headers: {
-                  Authorization: `Basic ${Buffer.from(`${process.env.SONAR_TOKEN}:`).toString('base64')}`
-                }
+                headers: { 'Authorization': `Basic ${auth}` }
               })
               const text = await res.text()
               let json = null
@@ -142,44 +134,44 @@ jobs:
               return { ok: res.ok, status: res.status, json, raw: text }
             }
 
-            let sonarEvidence = 'No se pudo obtener evidencia de SonarCloud.'
-            let sonarScopeNote = ''
+            let sonarSummary = 'No se proporcionó SONAR_TOKEN; no se consultaron métricas de SonarCloud.'
+            let sonarSource = 'N/A'
 
-            if (!process.env.SONAR_TOKEN) {
-              sonarEvidence = 'No hay SONAR_TOKEN configurado en los secrets del repositorio; no se consultó SonarCloud.'
-            } else {
-              core.startGroup('DEBUG: consulta a SonarCloud')
-              const projectKey = process.env.SONAR_PROJECT_KEY
+            if (sonarToken && sonarProjectKey) {
+              // 1) Intentar métricas específicas del análisis del PR
+              const prQuery = `component=${encodeURIComponent(sonarProjectKey)}&pullRequest=${pullNumber}&metricKeys=${sonarMetricKeys}`
+              let result = await fetchSonarMeasures(prQuery)
 
-              // 1) intento: métricas específicas del análisis de este PR
-              let result = await fetchSonarMeasures(projectKey, `pullRequest=${pullNumber}`)
-              core.info(`Intento pullRequest=${pullNumber} -> status ${result.status}`)
-
-              if (result.ok && result.json && result.json.component) {
-                sonarScopeNote = `Métricas del análisis específico del Pull Request #${pullNumber} en SonarCloud.`
+              if (result.ok && result.json?.component?.measures?.length) {
+                sonarSource = `Análisis de SonarCloud específico del PR #${pullNumber}`
               } else {
-                // 2) fallback: métricas generales de la rama main
-                core.warning(`SonarCloud no devolvió análisis para el PR #${pullNumber} (status ${result.status}). Usando fallback a la rama main.`)
-                result = await fetchSonarMeasures(projectKey, 'branch=main')
-                core.info(`Intento branch=main -> status ${result.status}`)
-                sonarScopeNote = 'ADVERTENCIA DE ALCANCE: SonarCloud no tiene un análisis específico para este PR. Las métricas mostradas son del estado GENERAL del proyecto (rama main), no exclusivas del diff de este PR.'
+                // 2) Fallback: métricas del proyecto sobre la rama principal
+                const branchQuery = `component=${encodeURIComponent(sonarProjectKey)}&branch=main&metricKeys=${sonarMetricKeys}`
+                result = await fetchSonarMeasures(branchQuery)
+                sonarSource = result.ok && result.json?.component?.measures?.length
+                  ? 'Análisis de SonarCloud de la rama main (no hay análisis específico de este PR; usar con cautela como evidencia indirecta)'
+                  : 'N/A'
               }
 
-              if (result.ok && result.json && result.json.component && result.json.component.measures) {
+              if (result.ok && result.json?.component?.measures?.length) {
                 const measures = result.json.component.measures
-                const measuredKeys = new Set(measures.map(m => m.metric))
-                const lines = measures.map(m => `- ${METRIC_LABELS[m.metric] || m.metric}: ${m.value}`)
-                const missing = SONAR_METRIC_KEYS.split(',').filter(k => !measuredKeys.has(k))
+                sonarSummary = measures
+                  .map(m => `- ${metricLabels[m.metric] || m.metric}: ${m.value}`)
+                  .join('\n')
+
+                const returnedKeys = measures.map(m => m.metric)
+                const missing = sonarMetricKeys.split(',').filter(k => !returnedKeys.includes(k))
                 if (missing.length) {
-                  lines.push(...missing.map(k => `- ${METRIC_LABELS[k] || k}: SIN DATO (no reportado por SonarCloud)`))
+                  sonarSummary += `\n\nMétricas no disponibles en SonarCloud para este componente: ${missing.map(k => metricLabels[k] || k).join(', ')}.`
                 }
-                sonarEvidence = `${sonarScopeNote}\n\n${lines.join('\n')}`
+              } else if (result.json?.errors) {
+                sonarSummary = `Error al consultar SonarCloud: ${result.json.errors.map(e => e.msg).join('; ')}`
               } else {
-                sonarEvidence = `No se pudieron obtener métricas de SonarCloud (HTTP ${result.status}). Respuesta: ${result.raw.slice(0, 300)}`
+                sonarSummary = `No se pudieron obtener métricas de SonarCloud (HTTP ${result.status}).`
               }
-              core.info(`Evidencia de Sonar construida:\n${sonarEvidence}`)
-              core.endGroup()
             }
+
+            const sonarEvidence = `Fuente: ${sonarSource}\n\n${sonarSummary}`
 
             const systemPrompt = [
               'Eres APR-1 (Auditor de Pull Requests), un agente auditor de calidad de software',
@@ -191,8 +183,8 @@ jobs:
               'CONTEXTO QUE RECIBIRÁS:',
               '1. El Anexo Técnico ISO/IEC 25010 del proyecto: una lista de condiciones con su',
               '   criterio, umbral y método de medición esperado.',
-              '2. Evidencia técnica de un Pull Request específico: el diff del código, la descripción',
-              '   del PR, el resultado del pipeline de CI, y métricas de SonarCloud asociadas.',
+              '2. Evidencia técnica de un Pull Request específico: puede ser el diff del código,',
+              '   el resultado del pipeline de CI, y/o métricas de SonarCloud asociadas a ese cambio.',
               '',
               'TU TAREA:',
               'Evalúa el Pull Request ÚNICAMENTE contra las condiciones del Anexo Técnico. Por',
@@ -201,8 +193,9 @@ jobs:
               '- Clasifícala en una de tres categorías: CUMPLE, NO CUMPLE o SIN EVIDENCIA SUFICIENTE.',
               '- Nunca marques CUMPLE si no tienes evidencia directa y explícita que lo sustente.',
               '  Ante la duda, clasifica como SIN EVIDENCIA SUFICIENTE en lugar de asumir.',
-              '- Si la evidencia de SonarCloud indica que las métricas son del proyecto general y no',
-              '  del PR específico, ten esto en cuenta como una limitación y menciónalo si aplica.',
+              '- Si la evidencia de SonarCloud corresponde a la rama principal y no a un análisis',
+              '  específico del PR, trátala como evidencia indirecta y dilo explícitamente en la',
+              '  columna de evidencia citada.',
               '- No asumas buenas intenciones del autor del PR: verifica, no infieras.',
               '',
               'REGLAS ESTRICTAS:',
@@ -227,15 +220,6 @@ jobs:
             const modelName = process.env.APR1_MODEL || 'openai/gpt-4o'
             const token = process.env.GH_MODELS_TOKEN
 
-            core.startGroup('DEBUG: llamada al modelo')
-            core.info(`Endpoint: ${apiEndpoint}`)
-            core.info(`Modelo: ${modelName}`)
-            core.info(`Token presente antes del fetch: ${Boolean(token)}`)
-            if (!token) {
-              core.warning('GH_MODELS_TOKEN está vacío. La llamada fallará con 401.')
-            }
-            core.endGroup()
-
             const response = await fetch(apiEndpoint, {
               method: 'POST',
               headers: {
@@ -253,17 +237,8 @@ jobs:
             })
 
             const rawText = await response.text()
-            core.startGroup('DEBUG: respuesta cruda del modelo')
-            core.info(`HTTP status: ${response.status}`)
-            core.info(`Cuerpo (primeros 2000 caracteres):\n${rawText.slice(0, 2000)}`)
-            core.endGroup()
-
             let result = null
-            try {
-              result = JSON.parse(rawText)
-            } catch (e) {
-              core.warning(`No se pudo parsear la respuesta como JSON: ${e.message}`)
-            }
+            try { result = JSON.parse(rawText) } catch (e) { /* noop */ }
 
             if (!response.ok || !result) {
               core.setFailed(`Falló la invocación del modelo (HTTP ${response.status}): ${rawText.slice(0, 500)}`)
